@@ -24,9 +24,11 @@ import com.wavesplatform.utx.UtxPool
 import com.wavesplatform.wallet.Wallet
 import io.netty.channel.group.ChannelGroup
 
-import scala.concurrent.Await
+import scala.concurrent.{Await, Future}
 import scala.concurrent.duration._
 import scala.util.control.NonFatal
+import akka.pattern.ask
+import akka.util.Timeout
 
 class Matcher(actorSystem: ActorSystem,
               utx: UtxPool,
@@ -37,6 +39,14 @@ class Matcher(actorSystem: ActorSystem,
     extends ScorexLogging {
 
   import settings._
+
+  private val addressActorDirectory = new ConcurrentHashMap[Address, Future[ActorRef]]()
+  private val directoryHandler: ActorRef = ???
+
+  def addressActor(address: Address): Future[ActorRef] = {
+    implicit val askTimeout: Timeout = 1.second
+    addressActorDirectory.get
+  }
 
   private val pairBuilder        = new AssetPairBuilder(settings.matcherSettings, blockchain)
   private val orderBookCache     = new ConcurrentHashMap[AssetPair, OrderBook](1000, 0.9f, 10)
@@ -68,10 +78,10 @@ class Matcher(actorSystem: ActorSystem,
   lazy val matcherApiRoutes = Seq(
     MatcherApiRoute(
       pairBuilder,
-      orderValidator,
+      matcherPrivateKey,
       matcher,
-      orderHistory,
       p => Option(orderBooks.get()).flatMap(_.get(p)),
+      _ => None,
       p => Option(marketStatuses.get(p)),
       orderBooksSnapshotCache,
       settings,

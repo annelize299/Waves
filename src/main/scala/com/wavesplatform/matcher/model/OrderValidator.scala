@@ -81,20 +81,21 @@ class OrderValidator(db: DB,
       }.left.map(_.toString)
     }
 
-  private def validateBalance(o: Order): ValidationResult = {
-    val senderAddress = o.sender.toAddress
-    val lo            = LimitOrder(o)
-    val actualBalance = Set(lo.feeAsset, lo.spentAsset).map(assetId => assetId -> spendableBalance(AssetAcc(senderAddress, assetId))).toMap
-    val openVolume    = actualBalance.map { case (assetId, _) => assetId -> DBUtils.openVolume(db, senderAddress, assetId) }
-    val change        = OrderInfoChange(o, None, OrderInfo(o.amount, 0L, None, None, o.matcherFee, Some(0L)))
-    val newOrder      = OrderHistory.diff(List(change)).getOrElse(senderAddress, OpenPortfolio.empty)
-    val needs         = OpenPortfolio(openVolume).combine(newOrder)
+  private def validateBalance(o: Order, openVolume: Option[AssetId] => Long): ValidationResult = {
+    val senderAddress    = o.sender.toAddress
+    val lo               = LimitOrder(o)
+    val spendAssets      = Set(lo.feeAsset, lo.spentAsset)
+    val actualOpenVolume = spendAssets.map(assetId => assetId -> openVolume(assetId)).toMap
+    val actualBalance    = spendAssets.map(assetId => assetId -> spendableBalance(AssetAcc(senderAddress, assetId))).toMap
+    val change           = OrderInfoChange(o, None, OrderInfo(o.amount, 0L, None, None, o.matcherFee, Some(0L)))
+    val newOrder         = OrderHistory.diff(List(change)).getOrElse(senderAddress, OpenPortfolio.empty)
+    val needs            = OpenPortfolio(actualOpenVolume).combine(newOrder)
 
     Either.cond(
       actualBalance.combine(needs.orders.mapValues(-_)).forall(_._2 >= 0),
       o,
       s"Not enough tradable balance. Order requires ${formatPortfolio(newOrder.orders)}, " +
-        s"available balance is ${formatPortfolio(actualBalance.combine(openVolume.mapValues(-_)))}"
+        s"available balance is ${formatPortfolio(actualBalance.combine(actualOpenVolume.mapValues(-_)))}"
     )
   }
 
@@ -112,21 +113,11 @@ class OrderValidator(db: DB,
                        s"Invalid price, last $insignificantDecimals digits must be 0")
     } yield o
 
-  def tradableBalance(acc: AssetAcc): Long =
-    timer
-      .refine("action" -> "tradableBalance")
-      .measure {
-        math.max(0l, spendableBalance(acc) - DBUtils.openVolume(db, acc.account, acc.assetId))
-      }
-
-  def validateNewOrder(order: Order): ValidationResult =
+  def validateNewOrder(order: Order, openVolume: Option[AssetId] => Long, activeOrderCount: Int, lowestOrderTs: Long): ValidationResult =
     timer
       .refine("action" -> "place", "pair" -> order.assetPair.toString)
       .measure {
         lazy val senderAddress = order.sender.toAddress
-        lazy val lowestOrderTs = DBUtils
-          .lastOrderTimestamp(db, order.senderPublicKey)
-          .getOrElse(settings.defaultOrderTimestamp) - settings.orderTimestampDrift
 
         lazy val minOrderFee: Long =
           ExchangeTransactionCreator.getMinFee(blockchain, settings.orderMatchTxFee, matcherPublicKey, Some(order.sender), None, order.assetPair)
@@ -153,8 +144,8 @@ class OrderValidator(db: DB,
           _ <- order.isValid(time.correctedTime()).toEither
           _ <- (Right(order): ValidationResult)
             .ensure("Order has already been placed")(o => DBUtils.orderInfo(db, o.id()).status == LimitOrder.NotFound)
-            .ensure(s"Limit of $MaxElements active orders has been reached")(o => DBUtils.activeOrderCount(db, o.senderPublicKey) < MaxElements)
-          _ <- validateBalance(order)
+            .ensure(s"Limit of $MaxElements active orders has been reached")(_ => activeOrderCount < MaxElements)
+          _ <- validateBalance(order, openVolume)
           _ <- validatePair(order.assetPair)
           _ <- validateDecimals(order)
           _ <- verifyOrderByAccountScript(order.sender, order)
